@@ -5,6 +5,9 @@ from dataclasses import dataclass, field
 from typing import (Callable, Dict, Iterable, List, Literal, Mapping, Optional,
                     Protocol, Set, Tuple, Union, overload)
 
+import inspect
+import pickle
+import sys
 import torch
 import torch.nn as nn
 from torch.func import functional_call
@@ -16,8 +19,12 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.multimodal import MultiModalPlaceholderMap, NestedTensors
 from vllm.sequence import IntermediateTensors
 from vllm.utils import is_pin_memory_available
+import threading
+
+_dump_lock = threading.Lock()
 
 logger = init_logger(__name__)
+
 
 WeightsMapping = Mapping[str, Optional[str]]
 """If a key maps to a value of `None`, the corresponding weight is ignored."""
@@ -133,13 +140,13 @@ class AutoWeightsLoader:
             weight_qualname = self._get_qualname(base_prefix, weight_name)
 
             if self._can_skip(weight_qualname):
-                logger.debug("Skipping weight %s", weight_qualname)
+                logger.info("Skipping weight %s", weight_qualname)
 
                 continue
 
             if weight_name != "":
                 if self._can_ignore_unexpected(weight_qualname):
-                    logger.debug("Ignoring weight %s", weight_qualname)
+                    logger.info("Ignoring weight %s", weight_qualname)
 
                     continue
 
@@ -151,7 +158,7 @@ class AutoWeightsLoader:
                                     default_weight_loader)
             weight_loader(param, weight_data)
 
-            logger.debug("Loaded weight %s with shape %s", weight_qualname,
+            logger.info("Loaded weight %s with shape %s", weight_qualname,
                          param.shape)
 
             yield weight_qualname
@@ -164,32 +171,61 @@ class AutoWeightsLoader:
     ) -> Iterable[str]:
         if isinstance(module, PPMissingLayer):
             return
+        
+        print("current_module", module, file=sys.stderr)
+        # print("self.module", self.module, file=sys.stderr)
 
         # Avoid infinite recursion since this function is typically
         # called inside load_weights of the module itself
+
+        if type(module).__name__ == "Qwen2ForEmbedding":
+            print(f"Class: {module.__class__.__name__}")
+            print(f"Module: {module.__class__.__module__}")
+            print(f"Defined in: {inspect.getfile(module.__class__)}")
+            print(inspect.getfile(module.load_weights))
+
+
+#             Class: Qwen2ForEmbedding
+#             Module: vllm.model_executor.models.adapters
+#             Defined in: /fs-computility/ai-shen/marunmin/vllm/vllm/model_executor/models/adapters.py
+#             /fs-computility/ai-shen/marunmin/vllm/vllm/model_executor/models/adapters.py
+
         if module != self.module:
+        # if module != self.module and type(module).__name__ != "Qwen2ForEmbedding":
+
+            # import ipdb; ipdb.set_trace()
+
             module_load_weights = getattr(module, "load_weights", None)
             if callable(module_load_weights):
                 loaded_params = module_load_weights(weights)
+                print("loaded_params", loaded_params, file=sys.stderr)
                 if loaded_params is None:
                     logger.warning(
                         "Unable to collect loaded parameters "
                         "for module %s", module)
+                    # dump_path = f"/fs-computility/ai-shen/marunmin/module_dump_{type(module).__name__}.pkl"
+                    # with _dump_lock:
+                    #     with open(dump_path, "wb") as f:
+                    #         pickle.dump(module.state_dict(), f)
+                    # logger.warning("Dumped problematic module to: %s", dump_path)
+                    # print("aaaaaaaaaaaaaaaaaaaaaaaaaaa", inspect.getsource(module.load_weights))
+
                 else:
+                    print("base_prefix", base_prefix, file=sys.stderr)
                     yield from map(
                         lambda x: self._get_qualname(base_prefix, x),
                         loaded_params,
                     )
-
         child_modules = dict(module.named_children())
         child_params = dict(module.named_parameters(recurse=False))
+        # print("child_modules", child_modules, file=sys.stderr)
 
         for child_prefix, child_weights in self._groupby_prefix(weights):
             prefix = self._get_qualname(base_prefix, child_prefix)
 
             if child_prefix in child_modules:
                 if self._can_skip(prefix + "."):
-                    logger.debug("Skipping module %s", prefix)
+                    logger.info("Skipping module %s", prefix)
 
                     continue
 
@@ -198,7 +234,7 @@ class AutoWeightsLoader:
                                              child_weights)
             elif child_prefix in child_params:
                 if self._can_skip(prefix):
-                    logger.debug("Skipping param %s", prefix)
+                    logger.info("Skipping param %s", prefix)
 
                     continue
 
@@ -208,14 +244,14 @@ class AutoWeightsLoader:
                 can_skip_module = self._can_skip(prefix + ".")
                 can_skip_param = self._can_skip(prefix)
                 if can_skip_module or can_skip_param:
-                    logger.debug("Skipping missing %s", prefix)
+                    logger.info("Skipping missing %s", prefix)
 
                     continue
 
                 can_ignore_module = self._can_ignore_unexpected(prefix + ".")
                 can_ignore_param = self._can_ignore_unexpected(prefix)
                 if can_ignore_module or can_ignore_param:
-                    logger.debug("Ignoring missing %s", prefix)
+                    logger.info("Ignoring missing %s", prefix)
 
                     continue
 
@@ -232,7 +268,10 @@ class AutoWeightsLoader:
         if mapper is not None:
             weights = mapper.apply(weights)
 
+        # print("module", self.module, file=sys.stderr)
+
         autoloaded_weights = set(self._load_module("", self.module, weights))
+        print(f"autoloaded_weights in {__file__}", list(autoloaded_weights), file=sys.stderr)
         return autoloaded_weights
 
 

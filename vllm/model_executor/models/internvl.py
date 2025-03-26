@@ -6,6 +6,8 @@
 # Copyright (c) 2023 OpenGVLab
 # Licensed under The MIT License [see LICENSE for details]
 # --------------------------------------------------------
+import sys
+import inspect
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping, Sequence
 from functools import cached_property
@@ -41,6 +43,9 @@ from .interfaces import MultiModalEmbeddings, SupportsMultiModal, SupportsPP
 from .utils import (AutoWeightsLoader, flatten_bn, init_vllm_registered_model,
                     maybe_prefix, merge_multimodal_embeddings)
 from .vision import scatter_patch_features, select_patch_features
+
+from vllm.model_executor.pooling_metadata import PoolingMetadata
+from vllm.sequence import IntermediateTensors, PoolerOutput
 
 IMG_START = '<img>'
 IMG_END = '</img>'
@@ -778,14 +783,14 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP):
 
     def _init_mlp1(self, config: PretrainedConfig) -> nn.Sequential:
         vit_hidden_size = config.vision_config.hidden_size
-        llm_hidden_size = config.text_config.hidden_size
+        self.llm_hidden_size = config.text_config.hidden_size
 
         return nn.Sequential(
             nn.LayerNorm(vit_hidden_size * int(1 / self.downsample_ratio)**2),
             nn.Linear(vit_hidden_size * int(1 / self.downsample_ratio)**2,
-                      llm_hidden_size),
+                      self.llm_hidden_size),
             nn.GELU(),
-            nn.Linear(llm_hidden_size, llm_hidden_size),
+            nn.Linear(self.llm_hidden_size, self.llm_hidden_size),
         )
 
     def pixel_shuffle(self, x, scale_factor=0.5):
@@ -1000,13 +1005,13 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP):
         hidden_states = self.language_model.model(**forward_kwargs)
         return hidden_states
 
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-    ) -> Optional[torch.Tensor]:
-        return self.language_model.compute_logits(hidden_states,
-                                                  sampling_metadata)
+    # def compute_logits(
+    #     self,
+    #     hidden_states: torch.Tensor,
+    #     sampling_metadata: SamplingMetadata,
+    # ) -> Optional[torch.Tensor]:
+    #     return self.language_model.compute_logits(hidden_states,
+    #                                               sampling_metadata)
 
     def sample(
         self,
@@ -1026,3 +1031,251 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP):
         ]
         loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes)
         return loader.load_weights(weights)
+
+
+
+class AttentionPooling(nn.Module):
+    """
+    Overview:
+        Attention pooling layer on the sequence dimension of LLM/VLM hidden states.
+    """
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int = 4,
+        qkv_bias: bool = False,
+        position_bias: bool = False,
+        position_bias_scale: float = 3.0,
+        prefix: str = "",
+    ):
+        super(AttentionPooling, self).__init__()
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.position_bias = position_bias
+        self.position_bias_scale = position_bias_scale
+
+        self.k = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
+        self.v = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
+        # 0.02 for better initialization
+        self.query = nn.Parameter(torch.randn(hidden_size) * 0.02)
+
+    def forward(self, hidden_states):
+        B, S, C = hidden_states.shape
+
+        # Multi-head projection for key and value
+        k = self.k(hidden_states).reshape(B, S, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # B, H, S, D
+        v = self.v(hidden_states).reshape(B, S, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # B, H, S, D
+
+        # Expand query for batch dimension
+        q = self.query.unsqueeze(0).expand(B, -1, -1)  # B, H, C
+        q = q.unsqueeze(2)  # B, H, 1, C
+        q = q.reshape(B, self.num_heads, 1, self.head_dim)  # B, H, 1, C
+
+        # Attention weights
+        attn = (q @ k.transpose(-2, -1)) * self.scale  # B, H, 1, S
+
+        # Add position bias
+        if self.position_bias:
+            position_bias = torch.arange(S, device=k.device).float() / S * self.position_bias_scale
+            attn = attn + position_bias.view(1, 1, 1, -1)  # Add position bias
+
+        # Attention pooling
+        attn = torch.softmax(attn, dim=-1)  # B, H, 1, S
+        out = (attn @ v).squeeze(2)  # B, H, D
+        out = out.reshape(B, -1)  # B, C
+
+        return out
+
+class InternVLSequenceClassificationModel(InternVLChatModel):
+    def __init__(self, vllm_config: VllmConfig, add_classify_head = 'last_hidden_states', pooling = 'last', prefix: str = ""):
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self.add_classify_head = add_classify_head # last_hidden_states, middle_hidden_states
+        self.pooling = pooling
+
+        self.classify_attention = AttentionPooling(hidden_size=self.llm_hidden_size)
+        self.classifier_heads = nn.Linear(self.llm_hidden_size, 2, bias=False)
+
+    def forward(
+            self,
+            pixel_values: torch.FloatTensor = None,
+            input_ids: torch.LongTensor = None,
+            intermediate_tensors: Optional[IntermediateTensors] = None,
+            attention_mask = None,
+            positions = None,
+            image_flags = None,
+            **kwargs,
+            # output_attentions = None,
+            # output_hidden_states = None,
+    ):
+        frame = inspect.currentframe()
+        args, _, _, values = inspect.getargvalues(frame)
+
+        print("Called forward with arguments:", file=sys.stderr)
+        for arg in args:
+            print(f"  {arg} = {type(values[arg])}", file=sys.stderr)
+        # print("Called forward with kwargs:", kwargs, file=sys.stderr)
+        print("input_ids:", input_ids.shape, file=sys.stderr)
+        # print("position", positions.shape, file=sys.stderr)
+
+        if positions is None and input_ids is not None:
+            if input_ids.dim() == 2:
+                batch_size, seq_len = input_ids.shape
+                positions = torch.arange(seq_len, dtype=torch.long, device=input_ids.device)
+                positions = positions.unsqueeze(0).expand(batch_size, -1)  # (batch_size, seq_len)
+            elif input_ids.dim() == 1:
+                seq_len = input_ids.shape[0]
+                positions = torch.arange(seq_len, dtype=torch.long, device=input_ids.device)  # (seq_len,)
+            else:
+                raise ValueError(f"Unexpected input_ids dimension: {input_ids.dim()}")
+        outputs = super().forward(
+            pixel_values = pixel_values,
+            input_ids=input_ids,
+            intermediate_tensors=intermediate_tensors,
+            attention_mask=attention_mask,
+            positions=positions,
+            image_flags=image_flags,
+            # output_attentions=output_attentions,
+            # output_hidden_states=True,
+            )
+        print("outputs", outputs.shape, file=sys.stderr)
+
+        # two ways of add classification heads
+        if self.add_classify_head == 'last_hidden_states':
+            # pooled_output = outputs.hidden_states[-1]
+            pooled_output = outputs
+
+        elif self.add_classify_head == 'middle_hidden_states':
+            pooled_output = outputs.hidden_states[int(len(outputs.hidden_states)/2)]
+        else:
+            raise ValueError("Unsupported add classify head place")
+
+        pooled_output = pooled_output.unsqueeze(0)
+        print("pooled_output_1", pooled_output.shape, file=sys.stderr)
+        
+
+        if self.pooling == "cls":
+            pooled_output = pooled_output[:, 0, :] 
+        elif self.pooling == "mean":
+            pooled_output = pooled_output.mean(dim=1) 
+        elif self.pooling == "max":
+            pooled_output = pooled_output.max(dim=1).values
+        elif self.pooling == "attention":
+            pooled_output = self.classify_attention(pooled_output)
+        elif self.pooling == 'last':
+            if self.config.pad_token_id is None:
+                last_non_pad_token = -1
+            elif input_ids is not None:
+                # To handle both left- and right- padding, we take the rightmost token that is not equal to pad_token_id
+                non_pad_mask = (input_ids != self.config.pad_token_id).to(pooled_output.device, torch.int32)
+                token_indices = torch.arange(input_ids.shape[-1], device=pooled_output.device)
+                last_non_pad_token = (token_indices * non_pad_mask).argmax(-1)
+            pooled_output = pooled_output[torch.arange(pooled_output.shape[0], device=pooled_output.device), last_non_pad_token]
+        else:
+            raise ValueError("Unsupported pooling method")
+        
+        print("pooled_output_2", pooled_output.shape, file=sys.stderr)
+
+
+        pooled_output = self.classifier_heads(pooled_output)
+
+        pooled_output = pooled_output - pooled_output.max(dim=1, keepdim=True).values
+
+        print("pooled_output_3", pooled_output.shape, file=sys.stderr)
+
+        # classification_loss = None
+        # if labels is not None:
+        #     loss_fct = CrossEntropyLoss()
+        #     classification_loss = loss_fct(pooled_output.view(-1, self.config.num_labels), label_class.view(-1))
+
+        # if not return_dict:
+        #     output = (pooled_output,) + outputs[1:]
+        #     return (classification_loss,) + output if classification_loss is not None else output
+
+        # return CausalLMOutputWithPast(
+        #     loss=classification_loss,
+        #     logits=pooled_output,
+        #     past_key_values=outputs.past_key_values,
+        #     hidden_states=outputs.hidden_states,
+        #     attentions=outputs.attentions,
+        # )
+
+        return pooled_output
+    
+    def pooler(
+        self,
+        hidden_states: torch.Tensor,
+        pooling_metadata: PoolingMetadata,
+    ) -> Optional[PoolerOutput]:
+        print("hidden_states", hidden_states, file=sys.stderr)
+        return hidden_states
+    
+    def load_weights(self, weights: Iterable[Tuple[str,
+                                                   torch.Tensor]]) -> Set[str]:
+        # unused modules appear in OpenGVLab/InternVideo2_5_Chat_8B
+        # skip_prefixes = [
+        #     "action_embed", "temporal_embed", "track_embed",
+        #     "track_embed_decoder", "box_token", "cg_criterion", "cg_model",
+        #     "loc_encoder", "loc_decoder", "sam", "temporal_token",
+        #     "track_token"
+        # ]
+        # loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes)
+        loader = AutoWeightsLoader(self)
+        print("-----------------------------------------", file=sys.stderr)
+
+        return loader.load_weights(weights)
+
+    # def chat(self, tokenizer, pixel_values, question, generation_config, history=None, return_history=False,
+    #          num_patches_list=None, IMG_START_TOKEN='<img>', IMG_END_TOKEN='</img>', IMG_CONTEXT_TOKEN='<IMG_CONTEXT>',
+    #          verbose=False):
+
+    #     if history is None and pixel_values is not None and '<image>' not in question:
+    #         question = '<image>\n' + question
+
+    #     if num_patches_list is None:
+    #         num_patches_list = [pixel_values.shape[0]] if pixel_values is not None else []
+    #     assert pixel_values is None or len(pixel_values) == sum(num_patches_list)
+
+    #     img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
+    #     self.img_context_token_id = img_context_token_id
+
+    #     template = get_conv_template(self.template) 
+    #     template.system_message = self.system_message
+    #     eos_token_id = tokenizer.convert_tokens_to_ids(template.sep.strip())
+
+    #     history = [] if history is None else history
+    #     for (old_question, old_answer) in history:
+    #         template.append_message(template.roles[0], old_question)
+    #         template.append_message(template.roles[1], old_answer)
+    #     template.append_message(template.roles[0], question)
+    #     template.append_message(template.roles[1], None)
+    #     query = template.get_prompt()
+
+    #     if verbose and pixel_values is not None:
+    #         image_bs = pixel_values.shape[0]
+    #         print(f'dynamic ViT batch size: {image_bs}')
+
+    #     for num_patches in num_patches_list:
+    #         image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * self.num_image_token * num_patches + IMG_END_TOKEN
+    #         query = query.replace('<image>', image_tokens, 1)
+
+    #     model_inputs = tokenizer(query, return_tensors='pt')
+    #     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    #     input_ids = model_inputs['input_ids'].to(device)
+    #     attention_mask = model_inputs['attention_mask'].to(device)
+    #     generation_config['eos_token_id'] = eos_token_id
+    #     with torch.no_grad():
+    #         outputs = self.forward(pixel_values=pixel_values,
+    #             input_ids=input_ids,
+    #             attention_mask=attention_mask,
+    #             image_flags=torch.tensor([1] * pixel_values.size(0), dtype=torch.long), return_dict=True)
+    #         logits = outputs[0]
+    #         predicted_label = torch.argmax(logits, dim=-1)
+    #     # generation_output = self.generate(
+    #     #     pixel_values=pixel_values,
+    #     #     input_ids=input_ids,
+    #     #     attention_mask=attention_mask,
+    #     #     **generation_config
+    #     # )
+        
+    #     return predicted_label

@@ -17,6 +17,7 @@ from contextlib import contextmanager
 from typing import (Any, Callable, Dict, Generator, Iterable, List, Optional,
                     Tuple, cast)
 
+import sys
 import gguf
 import huggingface_hub
 import numpy as np
@@ -418,11 +419,19 @@ class DefaultModelLoader(BaseModelLoader):
         device_config = vllm_config.device_config
         model_config = vllm_config.model_config
         target_device = torch.device(device_config.device)
+        # print("-------------model_config", vars(model_config), file=sys.stderr)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(vllm_config=vllm_config)
 
             weights_to_load = {name for name, _ in model.named_parameters()}
+            # print("weights_to_load: ", weights_to_load, file=sys.stderr)
+            # print("all_weights", self._get_all_weights(model_config, model), file=sys.stderr)
+            all_weights = list(self._get_all_weights(model_config, model))
+            # for name, _ in all_weights:
+            #     print(name, end=" ")
+            
+            # print("model", model, file=sys.stderr)
             loaded_weights = model.load_weights(
                 self._get_all_weights(model_config, model))
             self.counter_after_loading_weights = time.perf_counter()
@@ -433,6 +442,7 @@ class DefaultModelLoader(BaseModelLoader):
             # We only enable strict check for non-quantized models
             # that have loaded weights tracking currently.
             if model_config.quantization is None and loaded_weights is not None:
+                print(f"loaded_weights in {__file__}", loaded_weights, file=sys.stderr)
                 weights_not_loaded = weights_to_load - loaded_weights
                 if weights_not_loaded:
                     raise ValueError(
